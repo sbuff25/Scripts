@@ -625,7 +625,6 @@ public class FoliageSpawnerVolume : MonoBehaviour
 
         // Create sibling container (hidden from hierarchy so user can't click it)
         GameObject container = new GameObject(gameObject.name + "_Foliage");
-        container.hideFlags = HideFlags.HideInHierarchy;
         if (transform.parent != null)
             container.transform.SetParent(transform.parent, worldPositionStays: false);
         container.transform.SetPositionAndRotation(transform.position, transform.rotation);
