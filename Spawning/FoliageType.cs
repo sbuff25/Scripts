@@ -10,6 +10,9 @@ public class FoliageType
     [Tooltip("Prefab to spawn. Enable GPU Instancing on its material for best performance.")]
     public GameObject prefab;
 
+    [Tooltip("Array of prefab variants. If populated, a random variant is chosen per instance — overrides the single prefab above. Leave empty to use the single prefab.")]
+    public GameObject[] prefabs = new GameObject[0];
+
     [Tooltip("Instances per square unit within the volume.")]
     [Min(0.001f)]
     public float density = 1f;
@@ -91,4 +94,35 @@ public class FoliageType
     [Header("Mesh Combining")]
     [Tooltip("Combine spawned meshes by material to reduce draw calls. Best for simple objects (grass, small rocks). Prefab meshes must have Read/Write enabled in import settings.")]
     public bool combineMeshes = false;
+
+    /// <summary>
+    /// Returns a prefab to instantiate. If the <see cref="prefabs"/> array is
+    /// populated, picks a random entry; otherwise falls back to <see cref="prefab"/>.
+    /// </summary>
+    public GameObject GetRandomPrefab()
+    {
+        if (prefabs != null && prefabs.Length > 0)
+            return prefabs[Random.Range(0, prefabs.Length)];
+        return prefab;
+    }
+
+    /// <summary>
+    /// Returns a display name for combined meshes.
+    /// </summary>
+    public string GetCombineName()
+    {
+        if (prefabs != null && prefabs.Length > 0 && prefabs[0] != null)
+            return prefabs[0].name;
+        return prefab != null ? prefab.name : "Unknown";
+    }
+
+    /// <summary>
+    /// Returns true if at least one valid prefab is assigned.
+    /// </summary>
+    public bool HasAnyPrefab()
+    {
+        if (prefabs != null && prefabs.Length > 0)
+            return System.Array.Exists(prefabs, p => p != null);
+        return prefab != null;
+    }
 }
