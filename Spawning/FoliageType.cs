@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
@@ -94,6 +95,11 @@ public class FoliageType
     [Header("Mesh Combining")]
     [Tooltip("Combine spawned meshes by material to reduce draw calls. Best for simple objects (grass, small rocks). Prefab meshes must have Read/Write enabled in import settings.")]
     public bool combineMeshes = false;
+
+    // ── Spline Masks (Per-Type) ─────────────────────
+    [Header("Spline Masks (Per-Type)")]
+    [Tooltip("Additional spline masks for this type only. Combined with the volume's global masks. Leave empty to use only global masks.")]
+    public List<FoliageSplineMask> splineMasks = new List<FoliageSplineMask>();
 
     /// <summary>
     /// Returns a prefab to instantiate. If the <see cref="prefabs"/> array is

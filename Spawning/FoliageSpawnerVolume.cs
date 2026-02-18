@@ -32,15 +32,24 @@ public class FoliageSpawnerVolume : MonoBehaviour
     [Tooltip("Seed for reproducible results. Change to get a different layout.")]
     public int seed = 12345;
 
-    [Tooltip("Parent transform for spawned instances. If null, this transform is used.")]
+    [Tooltip("Parent transform for spawned instances. If null, a hidden sibling container is auto-created so selecting this spawner doesn't outline all foliage.")]
     public Transform spawnParent;
 
     [Tooltip("Mark spawned instances as static for batching. Can cause culling issues — disable if objects are invisible.")]
     public bool markStatic = false;
 
+    [Header("Spline Masks")]
+    [Tooltip("Spline-based include/exclude masks. Exclude masks block spawning inside the spline. Include masks restrict spawning to inside the spline. Applied to all types and clusters.")]
+    public List<FoliageSplineMask> splineMasks = new List<FoliageSplineMask>();
+
     [Header("Performance")]
     [Tooltip("Use batch raycasting (Jobs system) for faster spawning. Produces slightly different results than sequential mode for the same seed.")]
     public bool batchRaycasts = true;
+
+    // Auto-created sibling container — keeps spawned objects out of the spawner's
+    // child hierarchy so selecting the spawner doesn't outline all foliage.
+    [SerializeField, HideInInspector]
+    private Transform _spawnContainer;
 
     // Internal struct to unify foliage types and clusters for priority sorting
     private struct SpawnItem
@@ -62,7 +71,7 @@ public class FoliageSpawnerVolume : MonoBehaviour
     {
         Clear();
 
-        Transform parent = spawnParent != null ? spawnParent : transform;
+        Transform parent = GetSpawnTarget();
         Random.State prevState = Random.state;
         Random.InitState(seed);
 
@@ -110,12 +119,27 @@ public class FoliageSpawnerVolume : MonoBehaviour
 
         Vector3 rayDir = -transform.up;
 
+        // Rebuild spline mask polygons and partition by mode
+        List<FoliageSplineMask> globalIncludeMasks = null;
+        List<FoliageSplineMask> globalExcludeMasks = null;
+        RebuildAndPartitionMasks(splineMasks, ref globalIncludeMasks, ref globalExcludeMasks);
+
         foreach (SpawnItem item in items)
         {
             if (item.kind == SpawnItem.Kind.FoliageType)
             {
                 FoliageType foliage = foliageTypes[item.index];
                 if (!foliage.HasAnyPrefab()) continue;
+
+                // Merge global masks with per-type masks
+                List<FoliageSplineMask> effectiveInclude = globalIncludeMasks;
+                List<FoliageSplineMask> effectiveExclude = globalExcludeMasks;
+                if (foliage.splineMasks != null && foliage.splineMasks.Count > 0)
+                {
+                    effectiveInclude = MergeMaskLists(globalIncludeMasks, null);
+                    effectiveExclude = MergeMaskLists(globalExcludeMasks, null);
+                    RebuildAndPartitionMasks(foliage.splineMasks, ref effectiveInclude, ref effectiveExclude);
+                }
 
                 // Create category parent for this type
                 Transform category = CreateCategory(foliage.GetCombineName(), parent);
@@ -126,14 +150,24 @@ public class FoliageSpawnerVolume : MonoBehaviour
                     : null;
 
                 if (batchRaycasts)
-                    SpawnTypeBatched(foliage, count, half, rayDir, category, spacingGrid, globalExclusion);
+                    SpawnTypeBatched(foliage, count, half, rayDir, category, spacingGrid, globalExclusion, effectiveInclude, effectiveExclude);
                 else
-                    SpawnTypeSequential(foliage, count, half, rayDir, category, spacingGrid, globalExclusion);
+                    SpawnTypeSequential(foliage, count, half, rayDir, category, spacingGrid, globalExclusion, effectiveInclude, effectiveExclude);
             }
             else
             {
                 FoliageCluster cluster = foliageClusters[item.index];
                 if (cluster.entries == null || cluster.entries.Length == 0) continue;
+
+                // Merge global masks with per-cluster masks
+                List<FoliageSplineMask> effectiveInclude = globalIncludeMasks;
+                List<FoliageSplineMask> effectiveExclude = globalExcludeMasks;
+                if (cluster.splineMasks != null && cluster.splineMasks.Count > 0)
+                {
+                    effectiveInclude = MergeMaskLists(globalIncludeMasks, null);
+                    effectiveExclude = MergeMaskLists(globalExcludeMasks, null);
+                    RebuildAndPartitionMasks(cluster.splineMasks, ref effectiveInclude, ref effectiveExclude);
+                }
 
                 // Create category parent for this cluster
                 Transform category = CreateCategory(cluster.name, parent);
@@ -144,9 +178,9 @@ public class FoliageSpawnerVolume : MonoBehaviour
                     : null;
 
                 if (batchRaycasts)
-                    SpawnClusterBatched(cluster, count, half, rayDir, category, spacingGrid, globalExclusion);
+                    SpawnClusterBatched(cluster, count, half, rayDir, category, spacingGrid, globalExclusion, effectiveInclude, effectiveExclude);
                 else
-                    SpawnClusterSequential(cluster, count, half, rayDir, category, spacingGrid, globalExclusion);
+                    SpawnClusterSequential(cluster, count, half, rayDir, category, spacingGrid, globalExclusion, effectiveInclude, effectiveExclude);
             }
         }
 
@@ -160,7 +194,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     private void SpawnTypeSequential(
         FoliageType foliage, int count, Vector3 half, Vector3 rayDir,
-        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion)
+        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         List<GameObject> spawnedInstances = foliage.combineMeshes ? new List<GameObject>(count / 2) : null;
 
@@ -182,6 +217,10 @@ public class FoliageSpawnerVolume : MonoBehaviour
                     continue;
             }
 
+            // Spline mask check (pre-raycast, XZ-only)
+            if (!PassesSplineMasks(worldOrigin.x, worldOrigin.z, includeMasks, excludeMasks))
+                continue;
+
             if (!Physics.Raycast(worldOrigin, rayDir, out RaycastHit hit, maxRayDistance, surfaceLayers))
                 continue;
 
@@ -200,7 +239,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     private void SpawnTypeBatched(
         FoliageType foliage, int count, Vector3 half, Vector3 rayDir,
-        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion)
+        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         // Phase 1: Generate candidates and noise-filter
         List<Vector3> origins = new List<Vector3>(count);
@@ -220,6 +260,10 @@ public class FoliageSpawnerVolume : MonoBehaviour
                 if (Mathf.PerlinNoise(nx, nz) < foliage.noiseThreshold)
                     continue;
             }
+
+            // Spline mask check (pre-raycast, XZ-only)
+            if (!PassesSplineMasks(worldOrigin.x, worldOrigin.z, includeMasks, excludeMasks))
+                continue;
 
             origins.Add(worldOrigin);
         }
@@ -320,7 +364,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     private void SpawnClusterSequential(
         FoliageCluster cluster, int count, Vector3 half, Vector3 rayDir,
-        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion)
+        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         List<GameObject> allClusterInstances = cluster.combineMeshes ? new List<GameObject>() : null;
 
@@ -341,10 +386,14 @@ public class FoliageSpawnerVolume : MonoBehaviour
                     continue;
             }
 
+            // Spline mask check on cluster center (pre-raycast, XZ-only)
+            if (!PassesSplineMasks(worldOrigin.x, worldOrigin.z, includeMasks, excludeMasks))
+                continue;
+
             if (!Physics.Raycast(worldOrigin, rayDir, out RaycastHit hit, maxRayDistance, surfaceLayers))
                 continue;
 
-            ProcessClusterCenter(cluster, hit, half, rayDir, parent, spacingGrid, globalExclusion, allClusterInstances);
+            ProcessClusterCenter(cluster, hit, half, rayDir, parent, spacingGrid, globalExclusion, allClusterInstances, includeMasks, excludeMasks);
         }
 
         if (cluster.combineMeshes && allClusterInstances != null && allClusterInstances.Count > 0)
@@ -357,7 +406,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     private void SpawnClusterBatched(
         FoliageCluster cluster, int count, Vector3 half, Vector3 rayDir,
-        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion)
+        Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         // Phase 1: Generate center candidates and noise-filter
         List<Vector3> origins = new List<Vector3>(count);
@@ -377,6 +427,10 @@ public class FoliageSpawnerVolume : MonoBehaviour
                 if (Mathf.PerlinNoise(nx, nz) < cluster.noiseThreshold)
                     continue;
             }
+
+            // Spline mask check on cluster center (pre-raycast, XZ-only)
+            if (!PassesSplineMasks(worldOrigin.x, worldOrigin.z, includeMasks, excludeMasks))
+                continue;
 
             origins.Add(worldOrigin);
         }
@@ -403,7 +457,7 @@ public class FoliageSpawnerVolume : MonoBehaviour
             RaycastHit hit = results[i];
             if (hit.collider == null) continue;
 
-            ProcessClusterCenter(cluster, hit, half, -transform.up, parent, spacingGrid, globalExclusion, allClusterInstances);
+            ProcessClusterCenter(cluster, hit, half, -transform.up, parent, spacingGrid, globalExclusion, allClusterInstances, includeMasks, excludeMasks);
         }
 
         commands.Dispose();
@@ -419,7 +473,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     private void ProcessClusterCenter(
         FoliageCluster cluster, RaycastHit centerHit, Vector3 half, Vector3 rayDir,
         Transform parent, SpatialHash2D spacingGrid, ExclusionGrid globalExclusion,
-        List<GameObject> allClusterInstances)
+        List<GameObject> allClusterInstances,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         // Slope filter on center
         float slopeAngle = Vector3.Angle(centerHit.normal, Vector3.up);
@@ -444,7 +499,7 @@ public class FoliageSpawnerVolume : MonoBehaviour
             return;
 
         // Center accepted — spawn sub-instances
-        SpawnClusterInstances(cluster, centerPos, half, rayDir, parent, allClusterInstances);
+        SpawnClusterInstances(cluster, centerPos, half, rayDir, parent, allClusterInstances, includeMasks, excludeMasks);
 
         // Register center in grids
         spacingGrid?.Insert(centerPos);
@@ -459,7 +514,8 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     private void SpawnClusterInstances(
         FoliageCluster cluster, Vector3 centerPos, Vector3 half, Vector3 rayDir,
-        Transform parent, List<GameObject> allClusterInstances)
+        Transform parent, List<GameObject> allClusterInstances,
+        List<FoliageSplineMask> includeMasks, List<FoliageSplineMask> excludeMasks)
     {
         // Shared intra-cluster spacing grid
         float maxEntrySpacing = 0f;
@@ -489,6 +545,10 @@ public class FoliageSpawnerVolume : MonoBehaviour
                 Vector3 localOffset = localCenter + new Vector3(offsetX, 0f, offsetZ);
                 localOffset.y = half.y;
                 Vector3 worldRayOrigin = transform.TransformPoint(localOffset);
+
+                // Spline mask check on sub-instance (pre-raycast, XZ-only)
+                if (!PassesSplineMasks(worldRayOrigin.x, worldRayOrigin.z, includeMasks, excludeMasks))
+                    continue;
 
                 if (!Physics.Raycast(worldRayOrigin, rayDir, out RaycastHit hit, maxRayDistance, surfaceLayers))
                     continue;
@@ -546,6 +606,32 @@ public class FoliageSpawnerVolume : MonoBehaviour
         GameObject category = new GameObject(name);
         category.transform.SetParent(parent, worldPositionStays: false);
         return category.transform;
+    }
+
+    /// <summary>
+    /// Returns the transform to parent spawned instances under. If
+    /// <see cref="spawnParent"/> is set, uses that. Otherwise auto-creates
+    /// a hidden sibling container so spawned objects are NOT children of this
+    /// transform (prevents selection outline on all instances when the spawner
+    /// is selected in the hierarchy).
+    /// </summary>
+    private Transform GetSpawnTarget()
+    {
+        if (spawnParent != null)
+            return spawnParent;
+
+        if (_spawnContainer != null)
+            return _spawnContainer;
+
+        // Create sibling container (hidden from hierarchy so user can't click it)
+        GameObject container = new GameObject(gameObject.name + "_Foliage");
+        container.hideFlags = HideFlags.HideInHierarchy;
+        if (transform.parent != null)
+            container.transform.SetParent(transform.parent, worldPositionStays: false);
+        container.transform.SetPositionAndRotation(transform.position, transform.rotation);
+
+        _spawnContainer = container.transform;
+        return _spawnContainer;
     }
 
     /// <summary>
@@ -648,7 +734,7 @@ public class FoliageSpawnerVolume : MonoBehaviour
     /// </summary>
     public void Clear()
     {
-        Transform parent = spawnParent != null ? spawnParent : transform;
+        Transform parent = GetSpawnTarget();
 
 #if UNITY_EDITOR
         for (int i = parent.childCount - 1; i >= 0; i--)
@@ -661,6 +747,105 @@ public class FoliageSpawnerVolume : MonoBehaviour
             Destroy(parent.GetChild(i).gameObject);
         }
 #endif
+    }
+
+    private void OnDestroy()
+    {
+        if (_spawnContainer != null)
+        {
+#if UNITY_EDITOR
+            DestroyImmediate(_spawnContainer.gameObject);
+#else
+            Destroy(_spawnContainer.gameObject);
+#endif
+        }
+    }
+
+    // ── Spline Mask Helpers ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Rebuilds polygons for all valid masks in the list and partitions them
+    /// into include/exclude lists. Appends to existing lists if non-null.
+    /// </summary>
+    private static void RebuildAndPartitionMasks(
+        List<FoliageSplineMask> masks,
+        ref List<FoliageSplineMask> includeMasks,
+        ref List<FoliageSplineMask> excludeMasks)
+    {
+        if (masks == null) return;
+
+        for (int i = 0; i < masks.Count; i++)
+        {
+            FoliageSplineMask mask = masks[i];
+            if (mask == null || !mask.gameObject.activeInHierarchy) continue;
+            if (!mask.RebuildPolygon()) continue;
+
+            if (mask.mode == FoliageSplineMask.MaskMode.Include)
+            {
+                if (includeMasks == null) includeMasks = new List<FoliageSplineMask>();
+                includeMasks.Add(mask);
+            }
+            else
+            {
+                if (excludeMasks == null) excludeMasks = new List<FoliageSplineMask>();
+                excludeMasks.Add(mask);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates a new list containing all items from both input lists.
+    /// Returns null if both inputs are null or empty.
+    /// </summary>
+    private static List<FoliageSplineMask> MergeMaskLists(
+        List<FoliageSplineMask> a, List<FoliageSplineMask> b)
+    {
+        int countA = a != null ? a.Count : 0;
+        int countB = b != null ? b.Count : 0;
+
+        if (countA == 0 && countB == 0) return null;
+        if (countA == 0) return new List<FoliageSplineMask>(b);
+        if (countB == 0) return new List<FoliageSplineMask>(a);
+
+        var merged = new List<FoliageSplineMask>(countA + countB);
+        merged.AddRange(a);
+        merged.AddRange(b);
+        return merged;
+    }
+
+    /// <summary>
+    /// Tests a world-space XZ point against all spline masks.
+    /// Returns true if the point is allowed (passes all mask checks).
+    /// Logic: if ANY exclude mask contains the point → reject.
+    /// If include masks exist but NONE contain the point → reject.
+    /// </summary>
+    private static bool PassesSplineMasks(
+        float worldX, float worldZ,
+        List<FoliageSplineMask> includeMasks,
+        List<FoliageSplineMask> excludeMasks)
+    {
+        // Check exclude masks first (any match = reject)
+        if (excludeMasks != null)
+        {
+            for (int i = 0; i < excludeMasks.Count; i++)
+            {
+                if (excludeMasks[i].ContainsPointXZ(worldX, worldZ))
+                    return false;
+            }
+        }
+
+        // Check include masks (must be inside at least one, if any exist)
+        if (includeMasks != null && includeMasks.Count > 0)
+        {
+            for (int i = 0; i < includeMasks.Count; i++)
+            {
+                if (includeMasks[i].ContainsPointXZ(worldX, worldZ))
+                    return true;
+            }
+            return false; // Include masks exist but point is in none of them
+        }
+
+        return true; // No masks, or only exclude masks that didn't trigger
     }
 
     private void OnDrawGizmosSelected()

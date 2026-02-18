@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
@@ -72,4 +73,9 @@ public class FoliageCluster
     [Header("Mesh Combining")]
     [Tooltip("Combine all sub-instances by material to reduce draw calls. Prefab meshes must have Read/Write enabled.")]
     public bool combineMeshes = false;
+
+    // ── Spline Masks (Per-Cluster) ──────────────────
+    [Header("Spline Masks (Per-Cluster)")]
+    [Tooltip("Additional spline masks for this cluster only. Combined with the volume's global masks. Leave empty to use only global masks.")]
+    public List<FoliageSplineMask> splineMasks = new List<FoliageSplineMask>();
 }
