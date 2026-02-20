@@ -22,10 +22,25 @@ public class FoliageSpawnerVolumeEditor : Editor
 
         EditorGUILayout.Space(10);
 
-        // Count spawned instances
+        // Count spawned instances and show spawn area info
         Transform spawnTarget = ResolveSpawnTarget(spawner);
         int count = spawnTarget != null ? spawnTarget.childCount : 0;
-        EditorGUILayout.HelpBox($"Spawned instances: {count}", MessageType.Info);
+        string areaInfo;
+        if (spawner.surfaceRenderer != null)
+        {
+            Bounds b = spawner.surfaceRenderer.bounds;
+            Vector3 s = spawner.surfaceRenderer.transform.lossyScale;
+            float avgScale = (Mathf.Abs(s.x) + Mathf.Abs(s.z)) * 0.5f;
+            string scaleNote = Mathf.Abs(avgScale - 1f) > 0.01f
+                ? $"\nSurface scale: {avgScale:F1}x — foliage scale divided by {avgScale:F1}"
+                : "";
+            areaInfo = $"Spawned instances: {count}\nSurface: {spawner.surfaceRenderer.name} — {b.size.x:F0} x {b.size.z:F0} world units{scaleNote}";
+        }
+        else
+        {
+            areaInfo = $"Spawned instances: {count}\nManual volume: {spawner.volumeSize.x:F0} x {spawner.volumeSize.z:F0}";
+        }
+        EditorGUILayout.HelpBox(areaInfo, MessageType.Info);
 
         EditorGUILayout.Space(5);
 

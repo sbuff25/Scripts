@@ -4,6 +4,7 @@ using UnityEngine;
 /// <summary>
 /// Spawns foliage prefabs on the surface of terrain or meshes within a box volume.
 /// Scatters random XZ points, raycasts downward, and places prefab instances on hit surfaces.
+/// Optionally derives the spawn area from a surface object's world-space bounds (accounts for scale).
 /// See: https://docs.unity3d.com/ScriptReference/Physics.Raycast.html
 /// </summary>
 public class FoliageSpawnerVolume : MonoBehaviour
@@ -61,7 +62,10 @@ public class FoliageSpawnerVolume : MonoBehaviour
     }
 
     [Header("Volume")]
-    [Tooltip("Size of the spawning volume in local space.")]
+    [Tooltip("Optional surface object. When set, the spawn area is derived from this object's world-space bounds (accounts for scale). When null, uses manual Volume Size.")]
+    public Renderer surfaceRenderer;
+
+    [Tooltip("Size of the spawning volume in local space. Ignored when Surface Renderer is set.")]
     public Vector3 volumeSize = new Vector3(50f, 30f, 50f);
 
     [Header("Raycasting")]
@@ -93,6 +97,28 @@ public class FoliageSpawnerVolume : MonoBehaviour
     private Transform _spawnContainer;
 
     /// <summary>
+    /// Returns the world-space spawn area. When surfaceRenderer is set, uses its bounds.
+    /// Otherwise derives from the spawner's transform and volumeSize.
+    /// </summary>
+    private void GetSpawnArea(out Vector3 center, out Vector3 halfExtents, out float area)
+    {
+        if (surfaceRenderer != null)
+        {
+            // See: https://docs.unity3d.com/ScriptReference/Renderer-bounds.html
+            Bounds b = surfaceRenderer.bounds;
+            center = b.center;
+            halfExtents = b.extents;
+            area = b.size.x * b.size.z;
+        }
+        else
+        {
+            center = transform.position;
+            halfExtents = volumeSize * 0.5f;
+            area = volumeSize.x * volumeSize.z;
+        }
+    }
+
+    /// <summary>
     /// Clears existing instances and spawns fresh foliage for every entry.
     /// </summary>
     public void Spawn()
@@ -103,39 +129,70 @@ public class FoliageSpawnerVolume : MonoBehaviour
         Random.State prevState = Random.state;
         Random.InitState(seed);
 
-        Vector3 half = volumeSize * 0.5f;
-        float area = volumeSize.x * volumeSize.z;
-        Vector3 rayDir = -transform.up;
+        // Ensure physics colliders are up-to-date in edit mode.
+        // Physics.autoSyncTransforms is off by default in Unity 6.
+        // See: https://docs.unity3d.com/ScriptReference/Physics.SyncTransforms.html
+        Physics.SyncTransforms();
 
+        GetSpawnArea(out Vector3 spawnCenter, out Vector3 spawnHalf, out float spawnArea);
+
+        // When spawning on a scaled surface, normalize foliage scale so it looks correct.
+        // e.g. surface at scale 100 → foliage scale divided by 100.
+        // See: https://docs.unity3d.com/ScriptReference/Transform-lossyScale.html
+        float scaleMultiplier = 1f;
+        if (surfaceRenderer != null)
+        {
+            Vector3 s = surfaceRenderer.transform.lossyScale;
+            float avgScale = (Mathf.Abs(s.x) + Mathf.Abs(s.z)) * 0.5f;
+            if (avgScale > 0.001f && Mathf.Abs(avgScale - 1f) > 0.01f)
+                scaleMultiplier = 1f / avgScale;
+        }
+
+        if (foliageTypes == null || foliageTypes.Count == 0)
+        {
+            Debug.LogWarning("[FoliageSpawner] No foliage entries defined. Add entries to the Foliage Types list.");
+            Random.state = prevState;
+            return;
+        }
+
+        float sizeX = spawnHalf.x * 2f;
+        float sizeZ = spawnHalf.z * 2f;
+
+        int totalPlaced = 0;
         foreach (FoliageEntry foliage in foliageTypes)
         {
-            if (foliage.prefab == null) continue;
+            if (foliage.prefab == null)
+            {
+                Debug.LogWarning("[FoliageSpawner] Skipping entry with null prefab.");
+                continue;
+            }
 
             if (pattern == PlacementPattern.Random)
             {
-                int count = Mathf.RoundToInt(area * foliage.density);
+                int count = Mathf.RoundToInt(spawnArea * foliage.density);
                 for (int i = 0; i < count; i++)
                 {
-                    float x = Random.Range(-half.x, half.x);
-                    float z = Random.Range(-half.z, half.z);
-                    TryPlace(foliage, x, z, half, rayDir, parent);
+                    float x = Random.Range(-spawnHalf.x, spawnHalf.x);
+                    float z = Random.Range(-spawnHalf.z, spawnHalf.z);
+                    if (TryPlace(foliage, x, z, spawnCenter, spawnHalf, scaleMultiplier, parent))
+                        totalPlaced++;
                 }
             }
             else
             {
                 // Grid spacing derived from density: spacing = 1/sqrt(density)
                 float spacing = 1f / Mathf.Sqrt(Mathf.Max(foliage.density, 0.001f));
-                int cellsX = Mathf.Max(1, Mathf.FloorToInt(volumeSize.x / spacing));
-                int cellsZ = Mathf.Max(1, Mathf.FloorToInt(volumeSize.z / spacing));
-                float stepX = volumeSize.x / cellsX;
-                float stepZ = volumeSize.z / cellsZ;
+                int cellsX = Mathf.Max(1, Mathf.FloorToInt(sizeX / spacing));
+                int cellsZ = Mathf.Max(1, Mathf.FloorToInt(sizeZ / spacing));
+                float stepX = sizeX / cellsX;
+                float stepZ = sizeZ / cellsZ;
 
                 for (int xi = 0; xi < cellsX; xi++)
                 {
                     for (int zi = 0; zi < cellsZ; zi++)
                     {
-                        float x = -half.x + (xi + 0.5f) * stepX;
-                        float z = -half.z + (zi + 0.5f) * stepZ;
+                        float x = -spawnHalf.x + (xi + 0.5f) * stepX;
+                        float z = -spawnHalf.z + (zi + 0.5f) * stepZ;
 
                         if (pattern == PlacementPattern.JitteredGrid)
                         {
@@ -143,38 +200,47 @@ public class FoliageSpawnerVolume : MonoBehaviour
                             z += Random.Range(-0.5f, 0.5f) * stepZ * jitter;
                         }
 
-                        TryPlace(foliage, x, z, half, rayDir, parent);
+                        if (TryPlace(foliage, x, z, spawnCenter, spawnHalf, scaleMultiplier, parent))
+                            totalPlaced++;
                     }
                 }
             }
         }
 
+        if (totalPlaced == 0)
+            Debug.LogWarning($"[FoliageSpawner] 0 instances placed. Check: volume position over surface, Surface Layers mask, and volume size. " +
+                $"Center: {spawnCenter}, Half: {spawnHalf}, Layers: {surfaceLayers.value}");
+        else
+            Debug.Log($"[FoliageSpawner] Placed {totalPlaced} instances.");
+
         Random.state = prevState;
     }
 
     /// <summary>
-    /// Raycasts from a local XZ candidate and places a prefab if the surface passes all filters.
+    /// Raycasts from a world-space XZ offset and places a prefab if the surface passes all filters.
+    /// Returns true if an instance was placed.
     /// </summary>
-    private void TryPlace(FoliageEntry foliage, float localX, float localZ,
-        Vector3 half, Vector3 rayDir, Transform parent)
+    private bool TryPlace(FoliageEntry foliage, float offsetX, float offsetZ,
+        Vector3 spawnCenter, Vector3 spawnHalf, float scaleMultiplier, Transform parent)
     {
-        Vector3 worldOrigin = transform.TransformPoint(new Vector3(localX, half.y, localZ));
+        // Ray origin: center + XZ offset, at the top of the volume
+        Vector3 worldOrigin = spawnCenter + new Vector3(offsetX, spawnHalf.y, offsetZ);
 
-        if (!Physics.Raycast(worldOrigin, rayDir, out RaycastHit hit, maxRayDistance, surfaceLayers))
-            return;
+        if (!Physics.Raycast(worldOrigin, Vector3.down, out RaycastHit hit, maxRayDistance, surfaceLayers))
+            return false;
 
         float slope = Vector3.Angle(hit.normal, Vector3.up);
         if (slope < foliage.minSlopeAngle || slope > foliage.maxSlopeAngle)
-            return;
+            return false;
 
         Vector3 pos = hit.point + hit.normal * foliage.surfaceOffset;
 
-        // Bounds check
-        Vector3 localPos = transform.InverseTransformPoint(pos);
-        if (Mathf.Abs(localPos.x) > half.x ||
-            Mathf.Abs(localPos.y) > half.y ||
-            Mathf.Abs(localPos.z) > half.z)
-            return;
+        // Bounds check — ensure hit point is within the spawn area
+        Vector3 delta = pos - spawnCenter;
+        if (Mathf.Abs(delta.x) > spawnHalf.x ||
+            Mathf.Abs(delta.y) > spawnHalf.y ||
+            Mathf.Abs(delta.z) > spawnHalf.z)
+            return false;
 
         Quaternion rot = Quaternion.Slerp(
             Quaternion.identity,
@@ -187,11 +253,11 @@ public class FoliageSpawnerVolume : MonoBehaviour
         float minS = foliage.minScale < 0.01f ? 1f : foliage.minScale;
         float maxS = foliage.maxScale < 0.01f ? 1f : foliage.maxScale;
         if (maxS < minS) maxS = minS;
-        float scale = Random.Range(minS, maxS);
+        float scale = Random.Range(minS, maxS) * scaleMultiplier;
 
 #if UNITY_EDITOR
         GameObject instance = UnityEditor.PrefabUtility.InstantiatePrefab(foliage.prefab) as GameObject;
-        if (instance == null) return;
+        if (instance == null) return false;
         instance.transform.SetParent(parent, worldPositionStays: true);
         instance.transform.SetPositionAndRotation(pos, rot);
         instance.transform.localScale = Vector3.one * scale;
@@ -199,6 +265,7 @@ public class FoliageSpawnerVolume : MonoBehaviour
         GameObject instance = Instantiate(foliage.prefab, pos, rot, parent);
         instance.transform.localScale = Vector3.one * scale;
 #endif
+        return true;
     }
 
     /// <summary>
@@ -244,11 +311,22 @@ public class FoliageSpawnerVolume : MonoBehaviour
 
     private void OnDrawGizmosSelected()
     {
-        Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.25f);
-        Gizmos.matrix = transform.localToWorldMatrix;
-        Gizmos.DrawCube(Vector3.zero, volumeSize);
-
-        Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.7f);
-        Gizmos.DrawWireCube(Vector3.zero, volumeSize);
+        // Show the actual spawn area — from surface bounds or manual volume
+        if (surfaceRenderer != null)
+        {
+            Bounds b = surfaceRenderer.bounds;
+            Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.25f);
+            Gizmos.DrawCube(b.center, b.size);
+            Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.7f);
+            Gizmos.DrawWireCube(b.center, b.size);
+        }
+        else
+        {
+            Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.25f);
+            Gizmos.matrix = transform.localToWorldMatrix;
+            Gizmos.DrawCube(Vector3.zero, volumeSize);
+            Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.7f);
+            Gizmos.DrawWireCube(Vector3.zero, volumeSize);
+        }
     }
 }

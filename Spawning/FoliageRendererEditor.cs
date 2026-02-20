@@ -208,7 +208,8 @@ public class FoliageRendererEditor : Editor
             name = name,
             lodMeshes = new Mesh[] { mf.sharedMesh },
             lodMaterials = new Material[] { mr.sharedMaterial },
-            lodDistancesSq = new float[] { maxDist * maxDist }
+            lodDistancesSq = new float[] { maxDist * maxDist },
+            lodLocalMatrices = new Matrix4x4[] { Matrix4x4.identity }
         };
     }
 
@@ -222,9 +223,14 @@ public class FoliageRendererEditor : Editor
         LOD[] lods = lodGroup.GetLODs();
         float[] distancesSq = FoliageRenderer.ConvertLODDistances(lodGroup, cameraFOV, maxDist);
 
+        // Root transform — LOD child transforms are stored relative to this.
+        // See: https://docs.unity3d.com/ScriptReference/Transform-worldToLocalMatrix.html
+        Matrix4x4 rootWorldToLocal = lodGroup.transform.worldToLocalMatrix;
+
         var meshes = new List<Mesh>();
         var materials = new List<Material>();
         var distances = new List<float>();
+        var localMatrices = new List<Matrix4x4>();
 
         for (int i = 0; i < lods.Length; i++)
         {
@@ -234,6 +240,7 @@ public class FoliageRendererEditor : Editor
             // Use the first renderer with a valid mesh
             Mesh mesh = null;
             Material mat = null;
+            Matrix4x4 localMatrix = Matrix4x4.identity;
             foreach (Renderer r in renderers)
             {
                 if (r == null) continue;
@@ -242,6 +249,9 @@ public class FoliageRendererEditor : Editor
                 {
                     mesh = mf.sharedMesh;
                     mat = r.sharedMaterial;
+                    // Capture the renderer's transform relative to the LODGroup root.
+                    // This preserves any local offset/rotation the LOD child has.
+                    localMatrix = rootWorldToLocal * r.transform.localToWorldMatrix;
                     break;
                 }
             }
@@ -251,6 +261,7 @@ public class FoliageRendererEditor : Editor
             meshes.Add(mesh);
             materials.Add(mat);
             distances.Add(distancesSq[i]);
+            localMatrices.Add(localMatrix);
         }
 
         // Clamp last distance to maxRenderDistance
@@ -262,7 +273,8 @@ public class FoliageRendererEditor : Editor
             name = lodGroup.gameObject.name,
             lodMeshes = meshes.ToArray(),
             lodMaterials = materials.ToArray(),
-            lodDistancesSq = distances.ToArray()
+            lodDistancesSq = distances.ToArray(),
+            lodLocalMatrices = localMatrices.ToArray()
         };
     }
 
