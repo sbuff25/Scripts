@@ -78,18 +78,11 @@ public class FoliageRendererEditor : Editor
         var protoList = new List<FoliageRenderer.FoliagePrototype>();
         var instanceList = new List<FoliageRenderer.FoliageInstance>();
 
-        float cameraFOV = Camera.main != null ? Camera.main.fieldOfView : 60f;
-
-        // Collect spawned instance roots — these are either:
-        // - Prefab instances with LODGroups (treat as one instance with multiple LOD levels)
-        // - Simple objects with MeshFilter/MeshRenderer (single LOD)
         var instanceRoots = new List<Transform>();
         CollectInstanceRoots(spawnRoot, instanceRoots);
 
         foreach (Transform instanceRoot in instanceRoots)
         {
-            // Get prefab root for prototype keying
-            // See: https://docs.unity3d.com/ScriptReference/PrefabUtility.GetCorrespondingObjectFromSource.html
             GameObject prefabRoot = PrefabUtility.GetCorrespondingObjectFromOriginalSource(instanceRoot.gameObject);
             string protoKey = GetPrototypeKey(instanceRoot.gameObject, prefabRoot);
 
@@ -99,7 +92,7 @@ public class FoliageRendererEditor : Editor
                 protoMap[protoKey] = protoIndex;
 
                 FoliageRenderer.FoliagePrototype proto = BuildPrototype(
-                    instanceRoot.gameObject, prefabRoot, cameraFOV, renderer.maxRenderDistance);
+                    instanceRoot.gameObject, prefabRoot, renderer.maxRenderDistance);
                 protoList.Add(proto);
             }
 
@@ -117,37 +110,42 @@ public class FoliageRendererEditor : Editor
 
         EditorUtility.SetDirty(renderer);
 
-        // Destroy originals
-        Undo.RegisterFullObjectHierarchyUndo(spawnRoot.gameObject, "Capture Foliage (Destroy Originals)");
-        for (int i = spawnRoot.childCount - 1; i >= 0; i--)
-            DestroyImmediate(spawnRoot.GetChild(i).gameObject);
+        // Spawned GameObjects are kept alive — their LODGroups handle foreground rendering.
+        // The renderer only draws the background (last LOD) via DrawMeshInstanced.
 
-        Debug.Log($"[FoliageRenderer] Captured {instanceList.Count} instances across {protoList.Count} prototypes.");
+        // Log capture summary
+        Debug.Log($"[FoliageRenderer] Captured {instanceList.Count} instances across {protoList.Count} prototypes. " +
+                  "Originals kept for LODGroup foreground rendering.");
+        for (int p = 0; p < protoList.Count; p++)
+        {
+            var proto = protoList[p];
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"  Prototype {p} \"{proto.name}\" — {proto.lodMeshes.Length} LODs, objectSize={proto.objectSize:F2}m:");
+            for (int l = 0; l < proto.lodMeshes.Length; l++)
+            {
+                string meshName = proto.lodMeshes[l] != null ? proto.lodMeshes[l].name : "null";
+                int tris = proto.lodMeshes[l] != null ? (int)proto.lodMeshes[l].GetIndexCount(0) / 3 : 0;
+                float srth = proto.lodScreenHeights[l];
+                sb.Append($"\n    LOD {l}: {meshName} ({tris} tris), SRTH={srth:F4}");
+            }
+            Debug.Log(sb.ToString());
+        }
     }
 
-    /// <summary>
-    /// Collects spawned instance root transforms. Each collected transform represents
-    /// one foliage instance. Objects with LODGroups are collected as-is (their children
-    /// are LOD levels, not separate instances). Simple MeshRenderer objects are collected
-    /// directly. Empty group objects (categories) are recursed into.
-    /// </summary>
     private void CollectInstanceRoots(Transform root, List<Transform> results)
     {
         for (int i = 0; i < root.childCount; i++)
         {
             Transform child = root.GetChild(i);
 
-            // Has LODGroup → this is one instance with multiple LOD levels
             if (child.GetComponent<LODGroup>() != null)
             {
                 results.Add(child);
             }
-            // Has MeshRenderer but no LODGroup → simple single-LOD instance
             else if (child.GetComponent<MeshRenderer>() != null)
             {
                 results.Add(child);
             }
-            // No renderer, no LODGroup → category group, recurse
             else if (child.childCount > 0)
             {
                 CollectInstanceRoots(child, results);
@@ -155,16 +153,11 @@ public class FoliageRendererEditor : Editor
         }
     }
 
-    /// <summary>
-    /// Returns a stable key for grouping instances by prototype.
-    /// Uses the prefab original source for consistency.
-    /// </summary>
     private string GetPrototypeKey(GameObject sceneInstance, GameObject prefabRoot)
     {
         if (prefabRoot != null)
             return prefabRoot.GetInstanceID().ToString();
 
-        // Fallback: mesh + material identity from the first renderer found
         MeshRenderer mr = sceneInstance.GetComponent<MeshRenderer>();
         MeshFilter mf = sceneInstance.GetComponent<MeshFilter>();
         if (mr == null) mr = sceneInstance.GetComponentInChildren<MeshRenderer>();
@@ -175,113 +168,173 @@ public class FoliageRendererEditor : Editor
         return $"{meshId}_{matId}";
     }
 
-    /// <summary>
-    /// Builds a prototype from a scene instance. Checks the scene instance first
-    /// for a LODGroup (instantiated prefabs keep their LODGroups), then falls back
-    /// to the prefab source, then to a single-LOD prototype.
-    /// </summary>
     private FoliageRenderer.FoliagePrototype BuildPrototype(
-        GameObject sceneInstance, GameObject prefabRoot, float cameraFOV, float maxDist)
+        GameObject sceneInstance, GameObject prefabRoot, float maxDist)
     {
         // Check scene instance for LODGroup (instantiated prefabs have it)
         LODGroup lodGroup = sceneInstance.GetComponent<LODGroup>();
 
         if (lodGroup != null)
-            return BuildPrototypeFromLODGroup(lodGroup, cameraFOV, maxDist);
+            return BuildPrototypeFromLODGroup(lodGroup, maxDist);
 
         // Check prefab source for LODGroup
         if (prefabRoot != null)
         {
             LODGroup prefabLOD = prefabRoot.GetComponent<LODGroup>();
             if (prefabLOD != null)
-                return BuildPrototypeFromLODGroup(prefabLOD, cameraFOV, maxDist);
+                return BuildPrototypeFromLODGroup(prefabLOD, maxDist);
         }
 
-        // No LODGroup — single LOD
+        // No LODGroup — single LOD with full screen height
         MeshFilter mf = sceneInstance.GetComponent<MeshFilter>();
         MeshRenderer mr = sceneInstance.GetComponent<MeshRenderer>();
-
         string name = prefabRoot != null ? prefabRoot.name : sceneInstance.name;
+
+        // Compute local-space objectSize from mesh bounds
+        float objSize = 1f;
+        if (mf != null && mf.sharedMesh != null)
+        {
+            Vector3 s = mf.sharedMesh.bounds.size;
+            objSize = Mathf.Max(s.x, Mathf.Max(s.y, s.z));
+        }
+
+        Material mat0 = mr != null ? mr.sharedMaterial : null;
+        Material[] allMats = mr != null ? mr.sharedMaterials : new Material[] { mat0 };
 
         return new FoliageRenderer.FoliagePrototype
         {
             name = name,
             lodMeshes = new Mesh[] { mf.sharedMesh },
             lodMaterials = new Material[] { mr.sharedMaterial },
-            lodDistancesSq = new float[] { maxDist * maxDist },
-            lodLocalMatrices = new Matrix4x4[] { Matrix4x4.identity }
+            lodSubMeshMats = new FoliageRenderer.SubMeshMaterialSet[]
+            {
+                new FoliageRenderer.SubMeshMaterialSet { materials = allMats }
+            },
+            lodLocalMatrices = new Matrix4x4[] { Matrix4x4.identity },
+            lodScreenHeights = new float[] { 0f },
+            objectSize = objSize,
+            baseCutoff = ReadBaseCutoff(mat0)
         };
     }
 
     /// <summary>
-    /// Extracts per-LOD mesh, material, and distance data from a LODGroup.
+    /// Extracts per-LOD mesh, material, screen heights, and object size from a LODGroup.
+    /// Stores the raw screenRelativeTransitionHeight values and lodGroup.size so the
+    /// renderer can evaluate LODs per-frame using the actual camera FOV — matching
+    /// Unity's LODGroup exactly.
     /// See: https://docs.unity3d.com/ScriptReference/LODGroup.GetLODs.html
     /// </summary>
     private FoliageRenderer.FoliagePrototype BuildPrototypeFromLODGroup(
-        LODGroup lodGroup, float cameraFOV, float maxDist)
+        LODGroup lodGroup, float maxDist)
     {
         LOD[] lods = lodGroup.GetLODs();
-        float[] distancesSq = FoliageRenderer.ConvertLODDistances(lodGroup, cameraFOV, maxDist);
 
-        // Root transform — LOD child transforms are stored relative to this.
-        // See: https://docs.unity3d.com/ScriptReference/Transform-worldToLocalMatrix.html
+        // Use lodGroup.size — this is the exact value Unity's LODGroup uses internally
+        // for screen-ratio evaluation. It's in local space; at runtime the renderer
+        // multiplies by per-instance scale, matching Unity's behavior.
+        // See: https://docs.unity3d.com/ScriptReference/LODGroup-size.html
+        float objectSizeAtScale1 = lodGroup.size;
+
+        Debug.Log($"[Capture] \"{lodGroup.gameObject.name}\" lodGroup.size={lodGroup.size:F3}, " +
+                  $"lossyScale={lodGroup.transform.lossyScale}, {lods.Length} LOD levels");
+
         Matrix4x4 rootWorldToLocal = lodGroup.transform.worldToLocalMatrix;
 
         var meshes = new List<Mesh>();
         var materials = new List<Material>();
-        var distances = new List<float>();
+        var subMeshMats = new List<FoliageRenderer.SubMeshMaterialSet>();
+        var screenHeights = new List<float>();
         var localMatrices = new List<Matrix4x4>();
 
         for (int i = 0; i < lods.Length; i++)
         {
             Renderer[] renderers = lods[i].renderers;
-            if (renderers == null || renderers.Length == 0) continue;
+            if (renderers == null || renderers.Length == 0)
+            {
+                Debug.LogWarning($"[Capture] LOD {i} skipped — no renderers assigned.");
+                continue;
+            }
 
-            // Use the first renderer with a valid mesh
             Mesh mesh = null;
             Material mat = null;
+            Material[] allMats = null;
             Matrix4x4 localMatrix = Matrix4x4.identity;
             foreach (Renderer r in renderers)
             {
                 if (r == null) continue;
+
                 MeshFilter mf = r.GetComponent<MeshFilter>();
                 if (mf != null && mf.sharedMesh != null)
                 {
                     mesh = mf.sharedMesh;
                     mat = r.sharedMaterial;
-                    // Capture the renderer's transform relative to the LODGroup root.
-                    // This preserves any local offset/rotation the LOD child has.
+                    allMats = r.sharedMaterials;
+                    localMatrix = rootWorldToLocal * r.transform.localToWorldMatrix;
+                    break;
+                }
+
+                SkinnedMeshRenderer smr = r as SkinnedMeshRenderer;
+                if (smr != null && smr.sharedMesh != null)
+                {
+                    mesh = smr.sharedMesh;
+                    mat = r.sharedMaterial;
+                    allMats = r.sharedMaterials;
                     localMatrix = rootWorldToLocal * r.transform.localToWorldMatrix;
                     break;
                 }
             }
 
-            if (mesh == null) continue;
+            if (mesh == null)
+            {
+                Debug.LogWarning($"[Capture] LOD {i} skipped — {renderers.Length} renderer(s) but no valid mesh. " +
+                    $"Types: {string.Join(", ", System.Array.ConvertAll(renderers, r => r != null ? r.GetType().Name : "null"))}");
+                continue;
+            }
 
             meshes.Add(mesh);
             materials.Add(mat);
-            distances.Add(distancesSq[i]);
+            subMeshMats.Add(new FoliageRenderer.SubMeshMaterialSet { materials = allMats });
+            screenHeights.Add(lods[i].screenRelativeTransitionHeight);
             localMatrices.Add(localMatrix);
+
+            int subCount = mesh.subMeshCount;
+            int matCount = allMats != null ? allMats.Length : 0;
+            Debug.Log($"[Capture]   LOD {i}: {mesh.name} ({subCount} sub-mesh, {matCount} mat), " +
+                $"SRTH={lods[i].screenRelativeTransitionHeight:F4}");
         }
 
-        // Clamp last distance to maxRenderDistance
-        if (distances.Count > 0)
-            distances[distances.Count - 1] = maxDist * maxDist;
+        // Last LOD's SRTH is kept as-is — it defines the crossover distance
+        // where LODGroup culling ends and the background instanced renderer starts.
+
+        // Read base alpha cutoff from LOD 0 material
+        Material lod0Mat = materials.Count > 0 ? materials[0] : null;
 
         return new FoliageRenderer.FoliagePrototype
         {
             name = lodGroup.gameObject.name,
             lodMeshes = meshes.ToArray(),
             lodMaterials = materials.ToArray(),
-            lodDistancesSq = distances.ToArray(),
-            lodLocalMatrices = localMatrices.ToArray()
+            lodSubMeshMats = subMeshMats.ToArray(),
+            lodLocalMatrices = localMatrices.ToArray(),
+            lodScreenHeights = screenHeights.ToArray(),
+            objectSize = objectSizeAtScale1,
+            baseCutoff = ReadBaseCutoff(lod0Mat)
         };
     }
 
     /// <summary>
-    /// Finds the spawn root by looking for a FoliageSpawnerVolume and resolving
-    /// its spawn parent or auto-created container.
+    /// Reads the alpha cutoff base value from a material. Checks common property names.
     /// </summary>
+    private static float ReadBaseCutoff(Material mat)
+    {
+        if (mat == null) return 0.5f;
+        if (mat.HasProperty("_Cutoff"))
+            return mat.GetFloat("_Cutoff");
+        if (mat.HasProperty("_AlphaClipThreshold"))
+            return mat.GetFloat("_AlphaClipThreshold");
+        return 0.5f;
+    }
+
     private Transform FindSpawnRoot(FoliageRenderer renderer)
     {
         FoliageSpawnerVolume spawner = renderer.GetComponent<FoliageSpawnerVolume>();

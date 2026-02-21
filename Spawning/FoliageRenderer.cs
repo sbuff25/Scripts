@@ -3,9 +3,9 @@ using UnityEngine;
 using UnityEngine.Rendering;
 
 /// <summary>
-/// GPU instanced foliage renderer. Stores captured prototype and instance data,
-/// builds spatial chunks, performs frustum culling and distance-based LOD selection,
-/// and draws via <see cref="Graphics.DrawMeshInstanced"/>.
+/// Chunk-based background foliage renderer using Graphics.DrawMeshInstanced.
+/// Pre-bakes per-chunk instance matrices at init — zero per-instance work at runtime.
+/// Foreground trees are rendered by their spawned GameObjects with LODGroup crossfade.
 /// See: https://docs.unity3d.com/ScriptReference/Graphics.DrawMeshInstanced.html
 /// </summary>
 public class FoliageRenderer : MonoBehaviour
@@ -13,13 +13,22 @@ public class FoliageRenderer : MonoBehaviour
     // ── Serialized Data (set by editor capture) ──────────────────────────
 
     [System.Serializable]
+    public class SubMeshMaterialSet
+    {
+        public Material[] materials;
+    }
+
+    [System.Serializable]
     public class FoliagePrototype
     {
         public string name;
         public Mesh[] lodMeshes;
         public Material[] lodMaterials;
-        public float[] lodDistancesSq; // pre-squared distance thresholds per LOD
-        public Matrix4x4[] lodLocalMatrices; // per-LOD local transform relative to instance root
+        public SubMeshMaterialSet[] lodSubMeshMats;
+        public Matrix4x4[] lodLocalMatrices;
+        public float[] lodScreenHeights;
+        public float objectSize;
+        public float baseCutoff = 0.5f;
     }
 
     [System.Serializable]
@@ -36,100 +45,57 @@ public class FoliageRenderer : MonoBehaviour
     public FoliageInstance[] instances = new FoliageInstance[0];
 
     [Header("Settings")]
-    [Tooltip("Maximum distance at which foliage is rendered.")]
+    [Tooltip("Maximum distance at which background foliage chunks are rendered.")]
     public float maxRenderDistance = 500f;
 
-    [Tooltip("Size of spatial chunks for frustum culling.")]
+    [Tooltip("Chunk cell size in world units for spatial grouping and frustum culling.")]
     public float chunkSize = 32f;
-
-    [Tooltip("Width of crossfade zone between LOD levels (world units). 0 = disabled.")]
-    public float crossfadeWidth = 10f;
-
-    [Tooltip("Multiplier on effective distance for LOD selection. >1 = earlier transitions (less geo), <1 = later (more geo). 2 = LODs kick in at half the real distance.")]
-    [Range(0.5f, 4f)]
-    public float lodDistanceScale = 1f;
-
-    [Header("Distance Thinning")]
-    [Tooltip("Overall fraction of instances to render. 1 = all, 0.5 = half, 0 = none. Stacks with distance thinning.")]
-    [Range(0f, 1f)]
-    public float renderDensity = 1f;
-
-    [Tooltip("Distance at which instance thinning begins. Beyond this, fewer instances are drawn.")]
-    public float thinningStartDistance = 200f;
-
-    [Tooltip("Fraction of instances still rendered at max render distance. 0 = none, 1 = all (no thinning).")]
-    [Range(0f, 1f)]
-    public float thinningMinDensity = 0.1f;
-
-    [Tooltip("Curve power for thinning falloff. 1 = linear, higher = more aggressive (density drops faster after start distance).")]
-    [Range(1f, 4f)]
-    public float thinningCurve = 1f;
-
-    [Tooltip("Scale multiplier for surviving distant instances. Compensates for thinned-out neighbors. 1 = no compensation.")]
-    [Range(1f, 5f)]
-    public float thinningScaleCompensation = 1.5f;
-
-    [Tooltip("Width of the fade zone for thinning transitions (world units). Instances dither-fade instead of popping. 0 = hard cutoff.")]
-    public float thinningFadeWidth = 30f;
-
-    [Header("Triangle Budget")]
-    [Tooltip("Target maximum triangle count. Renderer dynamically reduces density when over budget. 0 = unlimited.")]
-    public int triangleBudget = 500000;
-
-    [Tooltip("How fast the budget density adjusts per frame. Lower = smoother but slower to react.")]
-    [Range(0.01f, 1f)]
-    public float budgetAdaptSpeed = 0.1f;
 
     // ── Runtime State ────────────────────────────────────────────────────
 
-    private class FoliageChunk
+    private struct ChunkProtoData
+    {
+        public int protoIndex;
+        public Matrix4x4[] matrices;
+        public int count;
+    }
+
+    private struct Chunk
     {
         public Bounds bounds;
-        public int[] instanceIndices;
+        public ChunkProtoData[] protos;
     }
 
-    private class DrawState
-    {
-        public Matrix4x4[][] lodLists; // [lodIndex] → matrix array
-        public float[][] lodFades;     // [lodIndex] → per-instance thinning fade (parallel to lodLists)
-        public int[] lodCounts;        // [lodIndex] → current fill count
-    }
+    private Chunk[] _chunks;
+    private int _chunkCount;
 
-    private FoliageChunk[] _chunks;
-    private DrawState[] _drawStates;
     private Matrix4x4[] _batchBuffer;
-    private float[] _fadeBatchBuffer;          // per-instance fade values for current batch
-    private Matrix4x4[] _cachedMatrices;       // pre-computed TRS per instance
-    private MaterialPropertyBlock _mpb;        // breaks SRP Batcher → enables GPU instancing
+    private MaterialPropertyBlock _mpb;
     private Plane[] _frustumPlanes = new Plane[6];
     private int _batchLimit;
     private bool _initialized;
 
-    // Crossfade
-    private Vector4[][] _crossfadeVectors; // [protoIndex][lodIndex] → _LODCrossfade value
-    private float[][] _crossfadeStartSq;   // [protoIndex][lodIndex] → squared distance where fade-out begins
-    private static readonly int _LODCrossfadeID = Shader.PropertyToID("_LODCrossfade");
+    // Per-prototype consolidated draw lists (filled from visible chunks each frame)
+    private Matrix4x4[][] _drawLists;
+    private int[] _drawCounts;
 
-    // Distance thinning
-    private float[] _instanceHash;        // pre-computed [0,1) hash per instance for stable thinning
-    private float _thinningStartSq;       // squared start distance (for early-out check)
-    private float _thinningStartDist;     // linear start distance
-    private float _thinningRangeInv;      // 1 / (maxRenderDistance - thinningStartDistance)
-    private float _thinningDensityRange;  // 1 - thinningMinDensity
-    private float _thinningScaleRange;    // thinningScaleCompensation - 1
-    private float _thinFadeMargin;        // density units over which instances dither-fade
+    // Per-prototype background rendering data
+    private int[] _bgLOD;
+    private float[] _protoWorldSize;
+    private Material[][] _bgMats;
 
-    // Per-instance shader property for dithered thinning fade
-    // See: https://docs.unity3d.com/ScriptReference/MaterialPropertyBlock.SetFloatArray.html
-    private static readonly int _ThinFadeID = Shader.PropertyToID("_ThinFade");
+    // Crossover (chunk-level LODGroup↔instancing boundary)
+    private float _maxCrossoverDistSq;
 
-    // Triangle budget
-    private float _budgetDensity = 1f;  // dynamic multiplier [0-1], adapts over frames
-    private int _lastTriCount;          // triangle count from previous frame's draw calls
+    private const float FrustumPadding = 10f;
+    private int _renderLayer;
+    private bool _cameraWarningLogged;
+    private bool _firstFrameLogged;
 
-    // Frustum edge fade
-    private const float FrustumPadding = 15f;
-    private float _frustumFadeInv;      // 1 / fade width for frustum edge dithering
+    // Debug (public for overlay)
+    [System.NonSerialized] public int debugVisibleChunks;
+    [System.NonSerialized] public int debugTotalChunks;
+    [System.NonSerialized] public int debugBackgroundCount;
 
     // ── Initialization ───────────────────────────────────────────────────
 
@@ -139,7 +105,8 @@ public class FoliageRenderer : MonoBehaviour
     }
 
     /// <summary>
-    /// Builds spatial chunks and allocates draw lists. Safe to call multiple times.
+    /// Builds chunks, pre-bakes per-chunk matrices, and resolves materials.
+    /// Safe to call multiple times.
     /// </summary>
     public void Initialize()
     {
@@ -151,14 +118,35 @@ public class FoliageRenderer : MonoBehaviour
 
         _batchLimit = DetectBatchLimit();
         _batchBuffer = new Matrix4x4[_batchLimit];
-        _fadeBatchBuffer = new float[_batchLimit];
         _mpb = new MaterialPropertyBlock();
 
-        PrecomputeMatrices();
+        _renderLayer = gameObject.layer;
+        _cameraWarningLogged = false;
+        _firstFrameLogged = false;
+
+        ValidateMaterials();
+        ComputeBackgroundLODs();
+        AllocateDrawLists();
         BuildChunks();
-        AllocateDrawStates();
-        PrecomputeCrossfade();
-        PrecomputeThinning();
+        SortInstancesByChunk();
+        BuildChunkDrawData();
+
+        Debug.Log($"[FoliageRenderer] {instances.Length} instances, {prototypes.Length} prototypes, " +
+                  $"{_chunkCount} chunks (size={chunkSize:F0}m), chunk-based rendering");
+
+        for (int p = 0; p < prototypes.Length; p++)
+        {
+            var proto = prototypes[p];
+            int bgLod = _bgLOD[p];
+            string meshName = (proto.lodMeshes != null && bgLod < proto.lodMeshes.Length && proto.lodMeshes[bgLod] != null)
+                ? proto.lodMeshes[bgLod].name : "null";
+            Material[] mats = _bgMats[p];
+            string matNames = mats.Length > 0
+                ? string.Join(", ", System.Array.ConvertAll(mats, m => m != null ? m.name : "null"))
+                : "NONE";
+            Debug.Log($"[FoliageRenderer] Proto {p} \"{proto.name}\" — bg LOD {bgLod}: " +
+                      $"{meshName}, worldSize={_protoWorldSize[p]:F2}m, mats=[{matNames}]");
+        }
 
         _initialized = true;
     }
@@ -168,196 +156,301 @@ public class FoliageRenderer : MonoBehaviour
         // See: https://docs.unity3d.com/ScriptReference/SystemInfo-graphicsDeviceType.html
         switch (SystemInfo.graphicsDeviceType)
         {
-            case GraphicsDeviceType.OpenGLES3:
-                return 125; // 16KB cbuffer / 128 bytes per matrix
-            case GraphicsDeviceType.Vulkan:
-                return 500;
-            default:
-                return 1023;
+            case GraphicsDeviceType.OpenGLES3: return 125;
+            case GraphicsDeviceType.Vulkan: return 500;
+            default: return 1023;
         }
     }
 
-    private void PrecomputeMatrices()
+    /// <summary>
+    /// Validates and auto-fixes materials for GPU instancing compatibility.
+    /// See: https://docs.unity3d.com/ScriptReference/Material-enableInstancing.html
+    /// </summary>
+    private void ValidateMaterials()
     {
-        _cachedMatrices = new Matrix4x4[instances.Length];
-        for (int i = 0; i < instances.Length; i++)
+        for (int p = 0; p < prototypes.Length; p++)
         {
-            ref FoliageInstance inst = ref instances[i];
-            _cachedMatrices[i] = Matrix4x4.TRS(
-                inst.position, inst.rotation, Vector3.one * inst.uniformScale);
+            FoliagePrototype proto = prototypes[p];
+            ValidateMaterialArray(proto.lodMaterials, proto.name);
+            if (proto.lodSubMeshMats != null)
+            {
+                for (int l = 0; l < proto.lodSubMeshMats.Length; l++)
+                {
+                    if (proto.lodSubMeshMats[l] != null)
+                        ValidateMaterialArray(proto.lodSubMeshMats[l].materials, proto.name);
+                }
+            }
         }
     }
+
+    private void ValidateMaterialArray(Material[] mats, string protoName)
+    {
+        if (mats == null) return;
+        for (int i = 0; i < mats.Length; i++)
+        {
+            Material mat = mats[i];
+            if (mat == null) continue;
+            if (!mat.enableInstancing)
+            {
+                Debug.LogWarning($"[FoliageRenderer] Enabling GPU Instancing on \"{mat.name}\" " +
+                    $"(proto \"{protoName}\"). Enable it on the material asset for builds.");
+                mat.enableInstancing = true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Determines background LOD index, average world size, and resolved materials per prototype.
+    /// The background LOD is the last captured LOD.
+    /// </summary>
+    private void ComputeBackgroundLODs()
+    {
+        int protoCount = prototypes.Length;
+        _bgLOD = new int[protoCount];
+        _protoWorldSize = new float[protoCount];
+        _bgMats = new Material[protoCount][];
+
+        float[] scaleSum = new float[protoCount];
+        int[] scaleCount = new int[protoCount];
+        for (int i = 0; i < instances.Length; i++)
+        {
+            int pi = instances[i].prototypeIndex;
+            if (pi >= 0 && pi < protoCount)
+            {
+                scaleSum[pi] += instances[i].uniformScale;
+                scaleCount[pi]++;
+            }
+        }
+
+        for (int p = 0; p < protoCount; p++)
+        {
+            var proto = prototypes[p];
+            int lodCount = proto.lodMeshes != null ? proto.lodMeshes.Length : 0;
+            _bgLOD[p] = Mathf.Max(0, lodCount - 1);
+
+            float avgScale = scaleCount[p] > 0 ? scaleSum[p] / scaleCount[p] : 1f;
+            _protoWorldSize[p] = proto.objectSize * avgScale;
+
+            // Resolve background materials
+            int bgLod = _bgLOD[p];
+            if (proto.lodSubMeshMats != null && bgLod < proto.lodSubMeshMats.Length
+                && proto.lodSubMeshMats[bgLod] != null
+                && proto.lodSubMeshMats[bgLod].materials != null
+                && proto.lodSubMeshMats[bgLod].materials.Length > 0)
+            {
+                _bgMats[p] = proto.lodSubMeshMats[bgLod].materials;
+            }
+            else if (proto.lodMaterials != null && bgLod < proto.lodMaterials.Length
+                && proto.lodMaterials[bgLod] != null)
+            {
+                _bgMats[p] = new Material[] { proto.lodMaterials[bgLod] };
+            }
+            else
+            {
+                _bgMats[p] = System.Array.Empty<Material>();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pre-allocates per-prototype draw lists sized to total instance count.
+    /// Visible chunk matrices are copied into these each frame before drawing.
+    /// </summary>
+    private void AllocateDrawLists()
+    {
+        int protoCount = prototypes.Length;
+        _drawLists = new Matrix4x4[protoCount][];
+        _drawCounts = new int[protoCount];
+
+        int[] protoCounts = new int[protoCount];
+        for (int i = 0; i < instances.Length; i++)
+        {
+            int pi = instances[i].prototypeIndex;
+            if (pi >= 0 && pi < protoCount)
+                protoCounts[pi]++;
+        }
+
+        for (int p = 0; p < protoCount; p++)
+            _drawLists[p] = new Matrix4x4[protoCounts[p]];
+    }
+
+    // ── Chunk Building ───────────────────────────────────────────────────
+
+    private int[] _tempChunkIndices;
+    private int[] _tempChunkStarts;
+    private int[] _tempChunkCounts;
 
     private void BuildChunks()
     {
-        var chunkMap = new Dictionary<long, List<int>>();
-        var chunkBounds = new Dictionary<long, Bounds>();
-        float cs = chunkSize;
+        float cs = Mathf.Max(chunkSize, 1f);
+        int n = instances.Length;
 
-        for (int i = 0; i < instances.Length; i++)
+        _tempChunkIndices = new int[n];
+        var cellMap = new Dictionary<long, int>();
+        var cellBounds = new List<Bounds>();
+        var cellCounts = new List<int>();
+
+        float maxObjRadius = 2f;
+        for (int i = 0; i < n; i++)
+        {
+            int pi = instances[i].prototypeIndex;
+            if (pi >= 0 && pi < prototypes.Length)
+            {
+                float r = instances[i].uniformScale * prototypes[pi].objectSize * 0.5f;
+                if (r > maxObjRadius) maxObjRadius = r;
+            }
+        }
+
+        for (int i = 0; i < n; i++)
         {
             Vector3 pos = instances[i].position;
             int cx = Mathf.FloorToInt(pos.x / cs);
             int cz = Mathf.FloorToInt(pos.z / cs);
             long key = ((long)cx << 32) | (uint)cz;
 
-            if (!chunkMap.TryGetValue(key, out List<int> list))
+            if (!cellMap.TryGetValue(key, out int cellIdx))
             {
-                list = new List<int>();
-                chunkMap[key] = list;
-                chunkBounds[key] = new Bounds(pos, Vector3.zero);
+                cellIdx = cellBounds.Count;
+                cellMap[key] = cellIdx;
+                cellBounds.Add(new Bounds(pos, Vector3.zero));
+                cellCounts.Add(0);
             }
 
-            list.Add(i);
+            _tempChunkIndices[i] = cellIdx;
 
-            Bounds b = chunkBounds[key];
+            Bounds b = cellBounds[cellIdx];
             b.Encapsulate(pos);
-            chunkBounds[key] = b;
+            cellBounds[cellIdx] = b;
+            cellCounts[cellIdx]++;
         }
 
-        // Convert to arrays and pad bounds vertically
-        _chunks = new FoliageChunk[chunkMap.Count];
-        int idx = 0;
-        foreach (var kvp in chunkMap)
+        _chunkCount = cellBounds.Count;
+        _chunks = new Chunk[_chunkCount];
+        _tempChunkCounts = new int[_chunkCount];
+
+        for (int c = 0; c < _chunkCount; c++)
         {
-            Bounds b = chunkBounds[kvp.Key];
-            // Pad vertically for tall objects and horizontally for scale
-            b.Expand(new Vector3(2f, 50f, 2f));
+            Bounds b = cellBounds[c];
+            b.Expand(new Vector3(maxObjRadius, 50f, maxObjRadius));
 
-            _chunks[idx++] = new FoliageChunk
-            {
-                bounds = b,
-                instanceIndices = kvp.Value.ToArray()
-            };
+            _chunks[c] = new Chunk { bounds = b, protos = null };
+            _tempChunkCounts[c] = cellCounts[c];
         }
+
+        debugTotalChunks = _chunkCount;
     }
 
-    private void AllocateDrawStates()
+    /// <summary>
+    /// Sorts instances so those in the same chunk are contiguous.
+    /// </summary>
+    private void SortInstancesByChunk()
     {
-        // Count instances per prototype
-        int[] protoCounts = new int[prototypes.Length];
-        for (int i = 0; i < instances.Length; i++)
+        int n = instances.Length;
+
+        var sortKeys = new int[n];
+        for (int i = 0; i < n; i++) sortKeys[i] = i;
+        int[] chunkIndices = _tempChunkIndices;
+        System.Array.Sort(sortKeys, (a, b) => chunkIndices[a].CompareTo(chunkIndices[b]));
+
+        var sortedInst = new FoliageInstance[n];
+        for (int i = 0; i < n; i++)
+            sortedInst[i] = instances[sortKeys[i]];
+        instances = sortedInst;
+
+        _tempChunkStarts = new int[_chunkCount];
+        int cursor = 0;
+        for (int c = 0; c < _chunkCount; c++)
         {
-            int pi = instances[i].prototypeIndex;
-            if (pi >= 0 && pi < prototypes.Length)
-                protoCounts[pi]++;
+            _tempChunkStarts[c] = cursor;
+            cursor += _tempChunkCounts[c];
         }
 
-        _drawStates = new DrawState[prototypes.Length];
+        _tempChunkIndices = null;
+    }
+
+    /// <summary>
+    /// Pre-bakes per-chunk, per-prototype instance matrices.
+    /// At runtime, these are sent directly to DrawMeshInstanced — no per-instance work.
+    /// </summary>
+    private void BuildChunkDrawData()
+    {
+        for (int c = 0; c < _chunkCount; c++)
+        {
+            int start = _tempChunkStarts[c];
+            int count = _tempChunkCounts[c];
+
+            // Group instances by prototype and pre-compute background LOD matrices
+            var protoGroups = new Dictionary<int, List<Matrix4x4>>();
+
+            for (int i = start; i < start + count; i++)
+            {
+                ref FoliageInstance inst = ref instances[i];
+                int pi = inst.prototypeIndex;
+                if (pi < 0 || pi >= prototypes.Length) continue;
+
+                int bgLod = _bgLOD[pi];
+                FoliagePrototype proto = prototypes[pi];
+
+                Matrix4x4 rootMatrix = Matrix4x4.TRS(
+                    inst.position, inst.rotation, Vector3.one * inst.uniformScale);
+                Matrix4x4 matrix = (proto.lodLocalMatrices != null && bgLod < proto.lodLocalMatrices.Length)
+                    ? rootMatrix * proto.lodLocalMatrices[bgLod] : rootMatrix;
+
+                if (!protoGroups.TryGetValue(pi, out var list))
+                {
+                    list = new List<Matrix4x4>();
+                    protoGroups[pi] = list;
+                }
+                list.Add(matrix);
+            }
+
+            var chunkProtos = new ChunkProtoData[protoGroups.Count];
+            int idx = 0;
+            foreach (var kvp in protoGroups)
+            {
+                chunkProtos[idx++] = new ChunkProtoData
+                {
+                    protoIndex = kvp.Key,
+                    matrices = kvp.Value.ToArray(),
+                    count = kvp.Value.Count
+                };
+            }
+
+            _chunks[c].protos = chunkProtos;
+        }
+
+        // Clear temp data
+        _tempChunkStarts = null;
+        _tempChunkCounts = null;
+    }
+
+    // ── Crossover Distance ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Computes the maximum crossover distance across all prototypes.
+    /// Chunks closer than this are in LODGroup territory and skipped.
+    /// See: https://docs.unity3d.com/ScriptReference/LODGroup.html
+    /// </summary>
+    private void UpdateMaxCrossoverDistance(float halfTan)
+    {
+        _maxCrossoverDistSq = 0f;
         for (int p = 0; p < prototypes.Length; p++)
         {
-            int lodCount = prototypes[p].lodMeshes != null ? prototypes[p].lodMeshes.Length : 0;
-            if (lodCount == 0) lodCount = 1;
+            var proto = prototypes[p];
+            int bgLod = _bgLOD[p];
+            float cullSRTH = (proto.lodScreenHeights != null && bgLod < proto.lodScreenHeights.Length)
+                ? proto.lodScreenHeights[bgLod] : 0f;
+            float worldSize = _protoWorldSize[p];
 
-            var state = new DrawState
+            if (cullSRTH > 0.001f && worldSize > 0.01f)
             {
-                lodLists = new Matrix4x4[lodCount][],
-                lodFades = new float[lodCount][],
-                lodCounts = new int[lodCount]
-            };
-
-            for (int l = 0; l < lodCount; l++)
-            {
-                state.lodLists[l] = new Matrix4x4[protoCounts[p]];
-                state.lodFades[l] = new float[protoCounts[p]];
-            }
-
-            _drawStates[p] = state;
-        }
-    }
-
-    private void PrecomputeCrossfade()
-    {
-        int protoCount = prototypes.Length;
-        _crossfadeVectors = new Vector4[protoCount][];
-        _crossfadeStartSq = new float[protoCount][];
-
-        float W = Mathf.Max(crossfadeWidth, 0f);
-
-        for (int p = 0; p < protoCount; p++)
-        {
-            FoliagePrototype proto = prototypes[p];
-            int lodCount = (proto.lodMeshes != null && proto.lodMeshes.Length > 0)
-                ? proto.lodMeshes.Length : 1;
-
-            // Convert squared distances to linear for shader
-            float[] dist = new float[lodCount];
-            for (int l = 0; l < lodCount; l++)
-            {
-                dist[l] = (proto.lodDistancesSq != null && l < proto.lodDistancesSq.Length)
-                    ? Mathf.Sqrt(proto.lodDistancesSq[l])
-                    : maxRenderDistance;
-            }
-
-            _crossfadeVectors[p] = new Vector4[lodCount];
-            _crossfadeStartSq[p] = new float[lodCount];
-
-            for (int l = 0; l < lodCount; l++)
-            {
-                float fiStart = 0f, fiEnd = 0f;
-                float foStart = 0f, foEnd = 0f;
-
-                // Fade-in from previous LOD boundary
-                if (l > 0 && W > 0f)
-                {
-                    fiEnd = dist[l - 1];
-                    fiStart = Mathf.Max(fiEnd - W, 0f);
-                }
-
-                // Fade-out toward next LOD or max distance
-                if (W > 0f)
-                {
-                    if (l < lodCount - 1)
-                    {
-                        foEnd = dist[l];
-                        foStart = Mathf.Max(foEnd - W, 0f);
-                    }
-                    else
-                    {
-                        foEnd = maxRenderDistance;
-                        foStart = Mathf.Max(maxRenderDistance - W, 0f);
-                    }
-                }
-
-                _crossfadeVectors[p][l] = new Vector4(fiStart, fiEnd, foStart, foEnd);
-                _crossfadeStartSq[p][l] = foStart * foStart;
+                float d = worldSize / (2f * cullSRTH * halfTan);
+                d *= 0.9f; // slight overlap so there's no gap at the crossover boundary
+                float dSq = d * d;
+                if (dSq > _maxCrossoverDistSq)
+                    _maxCrossoverDistSq = dSq;
             }
         }
-    }
-
-    private void PrecomputeThinning()
-    {
-        // Deterministic hash per instance — stable so trees don't flicker.
-        // Only needs to be computed once; thresholds are updated each frame
-        // so settings can be tweaked in real time during play mode.
-        _instanceHash = new float[instances.Length];
-        for (int i = 0; i < instances.Length; i++)
-        {
-            uint h = (uint)i;
-            h ^= h >> 16;
-            h *= 0x45d9f3b;
-            h ^= h >> 16;
-            _instanceHash[i] = (h & 0xFFFF) / 65535f;
-        }
-    }
-
-    private void UpdateThinningThresholds()
-    {
-        _thinningStartDist = Mathf.Clamp(thinningStartDistance, 0f, maxRenderDistance);
-        _thinningStartSq = _thinningStartDist * _thinningStartDist;
-        float range = maxRenderDistance - _thinningStartDist;
-        _thinningRangeInv = range > 0.001f ? 1f / range : 0f;
-        _thinningDensityRange = 1f - Mathf.Clamp01(thinningMinDensity);
-        _thinningScaleRange = Mathf.Max(thinningScaleCompensation, 1f) - 1f;
-
-        // Fade margin: density change over thinningFadeWidth distance.
-        // Instances whose hash is within this margin of the density threshold
-        // dither-fade instead of popping.
-        float fadeW = Mathf.Max(thinningFadeWidth, 0f);
-        if (range > 0.001f && fadeW > 0f)
-            _thinFadeMargin = renderDensity * _thinningDensityRange * (fadeW / range);
-        else
-            _thinFadeMargin = 0f;
     }
 
     // ── Render Loop ──────────────────────────────────────────────────────
@@ -367,267 +460,144 @@ public class FoliageRenderer : MonoBehaviour
         if (!_initialized) return;
 
         Camera cam = Camera.main;
-        if (cam == null) return;
-
-        // Recompute thinning thresholds each frame for real-time inspector tweaking
-        UpdateThinningThresholds();
-
-        // Adapt budget density based on previous frame's triangle count
-        if (triangleBudget > 0 && _lastTriCount > 0)
+        if (cam == null)
         {
-            float ratio = (float)triangleBudget / _lastTriCount;
-            // Target density: current * ratio, clamped [0.05, 1]
-            float target = Mathf.Clamp(_budgetDensity * ratio, 0.05f, 1f);
-            _budgetDensity = Mathf.Lerp(_budgetDensity, target, budgetAdaptSpeed);
+            if (!_cameraWarningLogged)
+            {
+                Debug.LogWarning("[FoliageRenderer] Camera.main is null — nothing will render. " +
+                    "Tag your camera with 'MainCamera'.");
+                _cameraWarningLogged = true;
+            }
+            return;
         }
-        else
-        {
-            _budgetDensity = 1f;
-        }
+
+        float halfTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+        UpdateMaxCrossoverDistance(halfTan);
+
+        // Auto-extend render distance if crossover exceeds maxRenderDistance.
+        float crossoverDist = Mathf.Sqrt(_maxCrossoverDistSq);
+        float effectiveMaxDist = Mathf.Max(maxRenderDistance, crossoverDist + 100f);
+        float maxDistSq = effectiveMaxDist * effectiveMaxDist;
 
         Vector3 camPos = cam.transform.position;
-        float maxDistSq = maxRenderDistance * maxRenderDistance;
 
         // See: https://docs.unity3d.com/ScriptReference/GeometryUtility.CalculateFrustumPlanes.html
         GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
-
-        // Pad frustum outward to create a dither-fade zone at screen edges.
-        // Instances in the padding zone fade in/out smoothly instead of popping.
-        // The triangle budget compensates for the extra instances this includes.
         for (int i = 0; i < 6; i++)
             _frustumPlanes[i].distance += FrustumPadding;
-        _frustumFadeInv = 1f / FrustumPadding;
 
-        // Clear draw counts
-        for (int p = 0; p < _drawStates.Length; p++)
+        // Clear consolidated draw lists
+        for (int p = 0; p < _drawCounts.Length; p++)
+            _drawCounts[p] = 0;
+
+        int visibleChunks = 0;
+        int bgCount = 0;
+
+        // ── Cull chunks and collect visible matrices into per-prototype lists ──
+        for (int c = 0; c < _chunkCount; c++)
         {
-            int[] counts = _drawStates[p].lodCounts;
-            for (int l = 0; l < counts.Length; l++)
-                counts[l] = 0;
-        }
+            ref Chunk chunk = ref _chunks[c];
 
-        // Cull chunks → select LOD → accumulate matrices
-        for (int c = 0; c < _chunks.Length; c++)
-        {
-            FoliageChunk chunk = _chunks[c];
-
-            // See: https://docs.unity3d.com/ScriptReference/GeometryUtility.TestPlanesAABB.html
+            // Frustum cull
             if (!GeometryUtility.TestPlanesAABB(_frustumPlanes, chunk.bounds))
                 continue;
 
-            int[] indices = chunk.instanceIndices;
-            for (int i = 0; i < indices.Length; i++)
+            // Chunk-level distance cull (XZ, using chunk center)
+            float dx = chunk.bounds.center.x - camPos.x;
+            float dz = chunk.bounds.center.z - camPos.z;
+            float chunkDistSq = dx * dx + dz * dz;
+
+            // Skip chunks in LODGroup territory (prevents double-rendering)
+            if (chunkDistSq < _maxCrossoverDistSq) continue;
+            if (chunkDistSq > maxDistSq) continue;
+
+            visibleChunks++;
+
+            // Copy this chunk's matrices into per-prototype consolidated lists
+            if (chunk.protos == null) continue;
+            for (int p = 0; p < chunk.protos.Length; p++)
             {
-                ref FoliageInstance inst = ref instances[indices[i]];
+                ref ChunkProtoData cpd = ref chunk.protos[p];
+                int pi = cpd.protoIndex;
+                if (pi < 0 || pi >= prototypes.Length) continue;
 
-                // 3D distance for LOD, thinning, and max-distance cull
-                float dx = inst.position.x - camPos.x;
-                float dy = inst.position.y - camPos.y;
-                float dz = inst.position.z - camPos.z;
-                float distSq = dx * dx + dy * dy + dz * dz;
-
-                if (distSq > maxDistSq) continue;
-
-                // Combined density: renderDensity × budget × distance-based thinning falloff
-                float density = renderDensity * _budgetDensity;
-                float thinT = 0f;
-                if (_thinningRangeInv > 0f && distSq > _thinningStartSq)
+                int dst = _drawCounts[pi];
+                int copyCount = Mathf.Min(cpd.count, _drawLists[pi].Length - dst);
+                if (copyCount > 0)
                 {
-                    float linear = (Mathf.Sqrt(distSq) - _thinningStartDist) * _thinningRangeInv;
-                    thinT = thinningCurve > 1.01f ? 1f - Mathf.Pow(1f - linear, thinningCurve) : linear;
-                    density *= 1f - thinT * _thinningDensityRange;
-                }
-
-                // Density culling with dithered fade
-                float thinFade = 1f;
-                if (density < 1f)
-                {
-                    float hash = _instanceHash[indices[i]];
-                    if (hash > density) continue; // fully culled
-
-                    // Instances near cull threshold get a fade value (0–1) for shader dithering
-                    if (_thinFadeMargin > 0f)
-                    {
-                        float fadeThreshold = density - _thinFadeMargin;
-                        if (hash > fadeThreshold)
-                            thinFade = (density - hash) / _thinFadeMargin;
-                    }
-                }
-
-                // Per-instance frustum cull + edge fade (dither across the padding zone)
-                float frustumDist = FrustumMinDistance(inst.position, inst.uniformScale);
-                if (frustumDist < 0f) continue;
-                thinFade *= Mathf.Clamp01(frustumDist * _frustumFadeInv);
-
-                int pi = inst.prototypeIndex;
-                FoliagePrototype proto = prototypes[pi];
-                DrawState state = _drawStates[pi];
-                Matrix4x4 rootMatrix = _cachedMatrices[indices[i]];
-
-                // Select primary LOD level (lodDistanceScale > 1 pushes transitions closer)
-                float lodDistSq = distSq * (lodDistanceScale * lodDistanceScale);
-                int lod = SelectLOD(proto, lodDistSq);
-
-                // Apply per-LOD local transform offset (handles child transforms in LODGroup prefabs)
-                Matrix4x4 matrix = (proto.lodLocalMatrices != null && lod < proto.lodLocalMatrices.Length)
-                    ? rootMatrix * proto.lodLocalMatrices[lod] : rootMatrix;
-
-                // Scale compensation — grow surviving distant instances to fill visual gaps
-                if (thinT > 0f && _thinningScaleRange > 0.001f)
-                {
-                    float sf = 1f + thinT * _thinningScaleRange;
-                    matrix.m00 *= sf; matrix.m01 *= sf; matrix.m02 *= sf;
-                    matrix.m10 *= sf; matrix.m11 *= sf; matrix.m12 *= sf;
-                    matrix.m20 *= sf; matrix.m21 *= sf; matrix.m22 *= sf;
-                }
-
-                // Add to primary LOD draw list with fade value
-                int count = state.lodCounts[lod];
-                if (count < state.lodLists[lod].Length)
-                {
-                    state.lodLists[lod][count] = matrix;
-                    state.lodFades[lod][count] = thinFade;
-                    state.lodCounts[lod] = count + 1;
-                }
-
-                // Crossfade: if in fade-out zone, also add to next LOD
-                if (crossfadeWidth > 0f && lod < state.lodCounts.Length - 1
-                    && lodDistSq >= _crossfadeStartSq[pi][lod])
-                {
-                    int nextLod = lod + 1;
-                    Matrix4x4 nextMatrix = (proto.lodLocalMatrices != null && nextLod < proto.lodLocalMatrices.Length)
-                        ? rootMatrix * proto.lodLocalMatrices[nextLod] : rootMatrix;
-
-                    if (thinT > 0f && _thinningScaleRange > 0.001f)
-                    {
-                        float sf = 1f + thinT * _thinningScaleRange;
-                        nextMatrix.m00 *= sf; nextMatrix.m01 *= sf; nextMatrix.m02 *= sf;
-                        nextMatrix.m10 *= sf; nextMatrix.m11 *= sf; nextMatrix.m12 *= sf;
-                        nextMatrix.m20 *= sf; nextMatrix.m21 *= sf; nextMatrix.m22 *= sf;
-                    }
-
-                    int nextCount = state.lodCounts[nextLod];
-                    if (nextCount < state.lodLists[nextLod].Length)
-                    {
-                        state.lodLists[nextLod][nextCount] = nextMatrix;
-                        state.lodFades[nextLod][nextCount] = thinFade;
-                        state.lodCounts[nextLod] = nextCount + 1;
-                    }
+                    System.Array.Copy(cpd.matrices, 0, _drawLists[pi], dst, copyCount);
+                    _drawCounts[pi] = dst + copyCount;
+                    bgCount += copyCount;
                 }
             }
         }
 
-        // Issue draw calls and count triangles for budget adaptation
-        int frameTris = 0;
+        debugVisibleChunks = visibleChunks;
+        debugBackgroundCount = bgCount;
+
+        // First-frame diagnostics
+        if (!_firstFrameLogged)
+        {
+            _firstFrameLogged = true;
+            Debug.Log($"[FoliageRenderer] === First frame ===");
+            Debug.Log($"  Camera: \"{cam.name}\", FOV={cam.fieldOfView:F1}°");
+            Debug.Log($"  maxRenderDistance={maxRenderDistance:F0}m, crossover={crossoverDist:F0}m, " +
+                      $"effectiveMax={effectiveMaxDist:F0}m");
+            Debug.Log($"  Chunks: {visibleChunks} visible / {_chunkCount} total");
+            Debug.Log($"  Background instances: {bgCount}");
+        }
+
+        // Issue consolidated draw calls (one set per prototype, not per chunk)
+        DrawConsolidated();
+    }
+
+    // ── Draw Calls ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Issues consolidated draw calls — one set per prototype from all visible chunks.
+    /// Minimizes batch count by drawing all instances of the same prototype together.
+    /// </summary>
+    private void DrawConsolidated()
+    {
         for (int p = 0; p < prototypes.Length; p++)
         {
+            int count = _drawCounts[p];
+            if (count == 0) continue;
+
+            int bgLod = _bgLOD[p];
             FoliagePrototype proto = prototypes[p];
-            DrawState state = _drawStates[p];
+            Mesh mesh = (proto.lodMeshes != null && bgLod < proto.lodMeshes.Length)
+                ? proto.lodMeshes[bgLod] : null;
+            if (mesh == null) continue;
 
-            for (int l = 0; l < state.lodCounts.Length; l++)
-            {
-                int count = state.lodCounts[l];
-                if (count == 0) continue;
+            Material[] mats = _bgMats[p];
+            if (mats.Length == 0) continue;
 
-                Mesh mesh = (proto.lodMeshes != null && l < proto.lodMeshes.Length)
-                    ? proto.lodMeshes[l] : null;
-                Material mat = (proto.lodMaterials != null && l < proto.lodMaterials.Length)
-                    ? proto.lodMaterials[l] : null;
-
-                if (mesh == null || mat == null) continue;
-
-                // See: https://docs.unity3d.com/ScriptReference/Mesh.GetIndexCount.html
-                frameTris += count * ((int)mesh.GetIndexCount(0) / 3);
-
-                _mpb.SetVector(_LODCrossfadeID, _crossfadeVectors[p][l]);
-                DrawBatched(mesh, mat, state.lodLists[l], state.lodFades[l], count);
-            }
+            DrawBatched(mesh, mats, _drawLists[p], count);
         }
-        _lastTriCount = frameTris;
     }
 
     /// <summary>
-    /// Returns the minimum signed distance from a point to any frustum plane,
-    /// or -1 if outside the frustum. Used both for culling and edge fade.
-    /// See: https://docs.unity3d.com/ScriptReference/Plane.GetDistanceToPoint.html
-    /// </summary>
-    private float FrustumMinDistance(Vector3 point, float radius)
-    {
-        float minDist = float.MaxValue;
-        for (int i = 0; i < 6; i++)
-        {
-            float d = _frustumPlanes[i].GetDistanceToPoint(point);
-            if (d < -radius) return -1f;
-            if (d < minDist) minDist = d;
-        }
-        return minDist;
-    }
-
-    private int SelectLOD(FoliagePrototype proto, float distSq)
-    {
-        if (proto.lodDistancesSq == null || proto.lodDistancesSq.Length == 0)
-            return 0;
-
-        for (int l = 0; l < proto.lodDistancesSq.Length; l++)
-        {
-            if (distSq < proto.lodDistancesSq[l])
-                return l;
-        }
-
-        // Beyond all LOD thresholds — use last LOD
-        return proto.lodDistancesSq.Length - 1;
-    }
-
-    /// <summary>
-    /// Issues batched DrawMeshInstanced calls with per-instance fade values.
+    /// Issues batched DrawMeshInstanced calls with per-sub-mesh materials.
     /// See: https://docs.unity3d.com/ScriptReference/Graphics.DrawMeshInstanced.html
     /// </summary>
-    private void DrawBatched(Mesh mesh, Material mat, Matrix4x4[] matrices, float[] fades, int count)
+    private void DrawBatched(Mesh mesh, Material[] mats, Matrix4x4[] matrices, int count)
     {
         int offset = 0;
         while (offset < count)
         {
             int batch = Mathf.Min(count - offset, _batchLimit);
             System.Array.Copy(matrices, offset, _batchBuffer, 0, batch);
-            System.Array.Copy(fades, offset, _fadeBatchBuffer, 0, batch);
-
-            _mpb.SetFloatArray(_ThinFadeID, _fadeBatchBuffer);
 
             for (int sub = 0; sub < mesh.subMeshCount; sub++)
-                Graphics.DrawMeshInstanced(mesh, sub, mat, _batchBuffer, batch, _mpb);
+            {
+                Material mat = sub < mats.Length ? mats[sub] : mats[0];
+                if (mat == null) continue;
+                Graphics.DrawMeshInstanced(mesh, sub, mat, _batchBuffer, batch, _mpb,
+                    ShadowCastingMode.On, true, _renderLayer);
+            }
 
             offset += batch;
         }
-    }
-
-    // ── Utility ──────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Converts a LODGroup's screen-relative transition heights to world-space
-    /// squared distances, using the given reference camera FOV.
-    /// See: https://docs.unity3d.com/ScriptReference/LODGroup.html
-    /// </summary>
-    public static float[] ConvertLODDistances(LODGroup lodGroup, float cameraFOV, float maxDist)
-    {
-        LOD[] lods = lodGroup.GetLODs();
-        float objectSize = lodGroup.size;
-        float halfTan = Mathf.Tan(cameraFOV * 0.5f * Mathf.Deg2Rad);
-
-        float[] distancesSq = new float[lods.Length];
-        for (int i = 0; i < lods.Length; i++)
-        {
-            float screenHeight = lods[i].screenRelativeTransitionHeight;
-            if (screenHeight > 0.001f)
-            {
-                float dist = objectSize / (2f * screenHeight * halfTan);
-                distancesSq[i] = dist * dist;
-            }
-            else
-            {
-                distancesSq[i] = maxDist * maxDist;
-            }
-        }
-
-        return distancesSq;
     }
 }
