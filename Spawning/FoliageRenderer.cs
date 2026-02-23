@@ -3,10 +3,10 @@ using UnityEngine;
 using UnityEngine.Rendering;
 
 /// <summary>
-/// Chunk-based background foliage renderer using Graphics.DrawMeshInstanced.
+/// Chunk-based background foliage renderer using Graphics.RenderMeshInstanced.
 /// Pre-bakes per-chunk instance matrices at init — zero per-instance work at runtime.
 /// Foreground trees are rendered by their spawned GameObjects with LODGroup crossfade.
-/// See: https://docs.unity3d.com/ScriptReference/Graphics.DrawMeshInstanced.html
+/// See: https://docs.unity3d.com/ScriptReference/Graphics.RenderMeshInstanced.html
 /// </summary>
 public class FoliageRenderer : MonoBehaviour
 {
@@ -69,7 +69,6 @@ public class FoliageRenderer : MonoBehaviour
     private Chunk[] _chunks;
     private int _chunkCount;
 
-    private Matrix4x4[] _batchBuffer;
     private MaterialPropertyBlock _mpb;
     private Plane[] _frustumPlanes = new Plane[6];
     private int _batchLimit;
@@ -117,7 +116,6 @@ public class FoliageRenderer : MonoBehaviour
             return;
 
         _batchLimit = DetectBatchLimit();
-        _batchBuffer = new Matrix4x4[_batchLimit];
         _mpb = new MaterialPropertyBlock();
 
         _renderLayer = gameObject.layer;
@@ -370,7 +368,7 @@ public class FoliageRenderer : MonoBehaviour
 
     /// <summary>
     /// Pre-bakes per-chunk, per-prototype instance matrices.
-    /// At runtime, these are sent directly to DrawMeshInstanced — no per-instance work.
+    /// At runtime, these are sent directly to RenderMeshInstanced — no per-instance work.
     /// </summary>
     private void BuildChunkDrawData()
     {
@@ -578,8 +576,9 @@ public class FoliageRenderer : MonoBehaviour
     }
 
     /// <summary>
-    /// Issues batched DrawMeshInstanced calls with per-sub-mesh materials.
-    /// See: https://docs.unity3d.com/ScriptReference/Graphics.DrawMeshInstanced.html
+    /// Issues batched RenderMeshInstanced calls with per-sub-mesh materials.
+    /// Uses startInstance parameter to avoid copying into a temp buffer.
+    /// See: https://docs.unity3d.com/ScriptReference/Graphics.RenderMeshInstanced.html
     /// </summary>
     private void DrawBatched(Mesh mesh, Material[] mats, Matrix4x4[] matrices, int count)
     {
@@ -587,14 +586,20 @@ public class FoliageRenderer : MonoBehaviour
         while (offset < count)
         {
             int batch = Mathf.Min(count - offset, _batchLimit);
-            System.Array.Copy(matrices, offset, _batchBuffer, 0, batch);
 
             for (int sub = 0; sub < mesh.subMeshCount; sub++)
             {
                 Material mat = sub < mats.Length ? mats[sub] : mats[0];
                 if (mat == null) continue;
-                Graphics.DrawMeshInstanced(mesh, sub, mat, _batchBuffer, batch, _mpb,
-                    ShadowCastingMode.On, true, _renderLayer);
+
+                var rparams = new RenderParams(mat)
+                {
+                    shadowCastingMode = ShadowCastingMode.On,
+                    receiveShadows = true,
+                    layer = _renderLayer,
+                    matProps = _mpb
+                };
+                Graphics.RenderMeshInstanced(rparams, mesh, sub, matrices, batch, offset);
             }
 
             offset += batch;
