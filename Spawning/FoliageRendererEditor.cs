@@ -107,11 +107,12 @@ public class FoliageRendererEditor : Editor
 
         renderer.prototypes = protoList.ToArray();
         renderer.instances = instanceList.ToArray();
+        renderer.foregroundRoot = spawnRoot;
 
         EditorUtility.SetDirty(renderer);
 
         // Spawned GameObjects are kept alive — their LODGroups handle foreground rendering.
-        // The renderer only draws the background (last LOD) via DrawMeshInstanced.
+        // The instanced renderer handles background chunks beyond crossoverDistance.
 
         // Log capture summary
         Debug.Log($"[FoliageRenderer] Captured {instanceList.Count} instances across {protoList.Count} prototypes. " +
@@ -255,6 +256,24 @@ public class FoliageRendererEditor : Editor
                 continue;
             }
 
+            // Count valid renderers for diagnostics
+            int validRendererCount = 0;
+            foreach (Renderer r in renderers)
+            {
+                if (r == null) continue;
+                MeshFilter mf = r.GetComponent<MeshFilter>();
+                SkinnedMeshRenderer smr = r as SkinnedMeshRenderer;
+                if ((mf != null && mf.sharedMesh != null) || (smr != null && smr.sharedMesh != null))
+                    validRendererCount++;
+            }
+
+            if (validRendererCount > 1)
+            {
+                Debug.LogWarning($"[Capture] LOD {i} has {validRendererCount} renderers — only the FIRST " +
+                    $"mesh will be used for background instancing. The others will only render in " +
+                    $"foreground (LODGroup) mode, causing extra draw calls.");
+            }
+
             Mesh mesh = null;
             Material mat = null;
             Material[] allMats = null;
@@ -299,8 +318,12 @@ public class FoliageRendererEditor : Editor
 
             int subCount = mesh.subMeshCount;
             int matCount = allMats != null ? allMats.Length : 0;
-            Debug.Log($"[Capture]   LOD {i}: {mesh.name} ({subCount} sub-mesh, {matCount} mat), " +
-                $"SRTH={lods[i].screenRelativeTransitionHeight:F4}");
+            int tris = (int)mesh.GetIndexCount(0) / 3;
+            int totalTris = 0;
+            for (int s = 0; s < subCount; s++)
+                totalTris += (int)mesh.GetIndexCount(s) / 3;
+            Debug.Log($"[Capture]   LOD {i}: {mesh.name} ({subCount} sub-mesh, {matCount} mat, {totalTris} tris), " +
+                $"SRTH={lods[i].screenRelativeTransitionHeight:F4}, renderers={validRendererCount}");
         }
 
         // Last LOD's SRTH is kept as-is — it defines the crossover distance
